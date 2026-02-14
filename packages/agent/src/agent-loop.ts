@@ -1,36 +1,20 @@
-/**
- * Agent loop that works with AgentMessage throughout.
- * Transforms to Message[] only at the LLM call boundary.
- */
-
-import {
-	type AssistantMessage,
-	type Context,
-	EventStream,
-	streamSimple,
-	type ToolResultMessage,
-	validateToolArguments,
-} from "@mariozechner/pi-ai";
+import { streamText, type CoreMessage } from "ai";
+import { EventStream } from "./utils/event-stream.js";
 import type {
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
 	AgentTool,
-	AgentToolResult,
-	StreamFn,
+	AgentAssistantMessage,
+	AgentToolMessage,
 } from "./types.js";
 
-/**
- * Start an agent loop with a new prompt message.
- * The prompt is added to the context and events are emitted for it.
- */
 export function agentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
-	streamFn?: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
 
@@ -48,32 +32,19 @@ export function agentLoop(
 			stream.push({ type: "message_end", message: prompt });
 		}
 
-		await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		await runLoop(currentContext, newMessages, config, signal, stream);
 	})();
 
 	return stream;
 }
 
-/**
- * Continue an agent loop from the current context without adding a new message.
- * Used for retries - context already has user message or tool results.
- *
- * **Important:** The last message in context must convert to a `user` or `toolResult` message
- * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
- * This cannot be validated here since `convertToLlm` is only called once per turn.
- */
 export function agentLoopContinue(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal?: AbortSignal,
-	streamFn?: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	if (context.messages.length === 0) {
 		throw new Error("Cannot continue: no messages in context");
-	}
-
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant");
 	}
 
 	const stream = createAgentStream();
@@ -85,7 +56,7 @@ export function agentLoopContinue(
 		stream.push({ type: "agent_start" });
 		stream.push({ type: "turn_start" });
 
-		await runLoop(currentContext, newMessages, config, signal, stream, streamFn);
+		await runLoop(currentContext, newMessages, config, signal, stream);
 	})();
 
 	return stream;
@@ -98,27 +69,20 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
-/**
- * Main loop logic shared by agentLoop and agentLoopContinue.
- */
 async function runLoop(
 	currentContext: AgentContext,
 	newMessages: AgentMessage[],
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
-	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
 		let steeringAfterTools: AgentMessage[] | null = null;
 
-		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
 			if (!firstTurn) {
 				stream.push({ type: "turn_start" });
@@ -126,7 +90,6 @@ async function runLoop(
 				firstTurn = false;
 			}
 
-			// Process pending messages (inject before next assistant response)
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
 					stream.push({ type: "message_start", message });
@@ -137,22 +100,21 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, stream, streamFn);
+			const message = await streamAssistantResponse(currentContext, config, signal, stream);
 			newMessages.push(message);
 
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
+			if (message.timestamp === -1) { 
 				stream.push({ type: "turn_end", message, toolResults: [] });
 				stream.push({ type: "agent_end", messages: newMessages });
-				stream.end(newMessages);
 				return;
 			}
 
-			// Check for tool calls
-			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			const toolCalls = Array.isArray(message.content) 
+				? message.content.filter((c) => c.type === "tool-call") 
+				: [];
 			hasMoreToolCalls = toolCalls.length > 0;
 
-			const toolResults: ToolResultMessage[] = [];
+			const toolResults: AgentToolMessage[] = [];
 			if (hasMoreToolCalls) {
 				const toolExecution = await executeToolCalls(
 					currentContext.tools,
@@ -170,9 +132,8 @@ async function runLoop(
 				}
 			}
 
-			stream.push({ type: "turn_end", message, toolResults });
+			stream.push({ type: "turn_end", message, toolResults: toolResults as any });
 
-			// Get steering messages after turn completes
 			if (steeringAfterTools && steeringAfterTools.length > 0) {
 				pendingMessages = steeringAfterTools;
 				steeringAfterTools = null;
@@ -181,237 +142,166 @@ async function runLoop(
 			}
 		}
 
-		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
 			continue;
 		}
 
-		// No more messages, exit
 		break;
 	}
 
 	stream.push({ type: "agent_end", messages: newMessages });
-	stream.end(newMessages);
 }
 
-/**
- * Stream an assistant response from the LLM.
- * This is where AgentMessage[] gets transformed to Message[] for the LLM.
- */
 async function streamAssistantResponse(
 	context: AgentContext,
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-	streamFn?: StreamFn,
-): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+): Promise<AgentAssistantMessage> {
 	let messages = context.messages;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
+	const llmMessages: CoreMessage[] = config.convertToLlm 
+		? await config.convertToLlm(messages)
+		: messages.map(({ timestamp, usage, ...rest }: any) => rest as CoreMessage);
 
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
+    const result = await streamText({
+        model: config.model as any,
+        messages: llmMessages,
+        system: context.systemPrompt,
+        abortSignal: signal,
+        tools: context.tools ? Object.fromEntries(context.tools.map(t => [t.name, {
+            description: t.description,
+            parameters: t.parameters as any
+        }])) : undefined,
+    });
 
-	const streamFunction = streamFn || streamSimple;
+    const assistantMessage: AgentAssistantMessage = {
+        role: "assistant",
+        content: [],
+        timestamp: Date.now(),
+    };
 
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+    stream.push({ type: "message_start", message: assistantMessage });
 
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
+    for await (const part of result.fullStream) {
+        if (part.type === 'text-delta') {
+            const lastPart = assistantMessage.content[assistantMessage.content.length - 1];
+            if (lastPart?.type === 'text') {
+                lastPart.text += part.textDelta;
+            } else {
+                assistantMessage.content.push({ type: 'text', text: part.textDelta });
+            }
+            stream.push({ type: "message_update", message: assistantMessage, assistantMessageEvent: part as any });
+        }
+        
+        if (part.type === 'tool-call') {
+            assistantMessage.content.push({
+                type: 'tool-call',
+                toolCallId: part.toolCallId,
+                toolName: part.toolName,
+                args: part.args as any,
+            });
+            stream.push({ type: "message_update", message: assistantMessage, assistantMessageEvent: part as any });
+        }
+    }
 
-	let partialMessage: AssistantMessage | null = null;
-	let addedPartial = false;
+    try {
+        const finalResult = await result;
+        assistantMessage.usage = {
+            input: finalResult.usage.promptTokens,
+            output: finalResult.usage.completionTokens,
+            totalTokens: finalResult.usage.totalTokens,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+        };
+    } catch (e) {
+        assistantMessage.timestamp = -1; 
+    }
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial;
-				context.messages.push(partialMessage);
-				addedPartial = true;
-				stream.push({ type: "message_start", message: { ...partialMessage } });
-				break;
-
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
-					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
-					stream.push({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					});
-				}
-				break;
-
-			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
-				}
-				if (!addedPartial) {
-					stream.push({ type: "message_start", message: { ...finalMessage } });
-				}
-				stream.push({ type: "message_end", message: finalMessage });
-				return finalMessage;
-			}
-		}
-	}
-
-	return await response.result();
+    stream.push({ type: "message_end", message: assistantMessage });
+    return assistantMessage;
 }
 
-/**
- * Execute tool calls from an assistant message.
- */
 async function executeToolCalls(
 	tools: AgentTool<any>[] | undefined,
-	assistantMessage: AssistantMessage,
+	assistantMessage: AgentAssistantMessage,
 	signal: AbortSignal | undefined,
 	stream: EventStream<AgentEvent, AgentMessage[]>,
-	getSteeringMessages?: AgentLoopConfig["getSteeringMessages"],
-): Promise<{ toolResults: ToolResultMessage[]; steeringMessages?: AgentMessage[] }> {
-	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
-	const results: ToolResultMessage[] = [];
+	getSteeringMessages?: () => Promise<AgentMessage[]>,
+): Promise<{ toolResults: AgentToolMessage[]; steeringMessages?: AgentMessage[] }> {
+	const toolCalls = assistantMessage.content.filter((c) => c.type === "tool-call") as any[];
+	const results: AgentToolMessage[] = [];
 	let steeringMessages: AgentMessage[] | undefined;
 
 	for (let index = 0; index < toolCalls.length; index++) {
 		const toolCall = toolCalls[index];
-		const tool = tools?.find((t) => t.name === toolCall.name);
+		const tool = tools?.find((t) => t.name === toolCall.toolName);
 
 		stream.push({
 			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
+			toolCallId: toolCall.toolCallId,
+			toolName: toolCall.toolName,
+			args: toolCall.args,
 		});
 
-		let result: AgentToolResult<any>;
-		let isError = false;
+		let result: any;
 
 		try {
-			if (!tool) throw new Error(`Tool ${toolCall.name} not found`);
-
-			const validatedArgs = validateToolArguments(tool, toolCall);
-
-			result = await tool.execute(toolCall.id, validatedArgs, signal, (partialResult) => {
+			if (!tool) throw new Error(`Tool ${toolCall.toolName} not found`);
+			if (!tool.execute) throw new Error(`Tool ${toolCall.toolName} has no execute function`);
+			
+			result = await tool.execute(toolCall.toolCallId, toolCall.args, signal, (partialResult) => {
 				stream.push({
 					type: "tool_execution_update",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					args: toolCall.arguments,
+					toolCallId: toolCall.toolCallId,
+					toolName: toolCall.toolName,
+					args: toolCall.args,
 					partialResult,
 				});
 			});
 		} catch (e) {
-			result = {
-				content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-				details: {},
-			};
-			isError = true;
+			result = e instanceof Error ? e.message : String(e);
 		}
 
 		stream.push({
 			type: "tool_execution_end",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
+			toolCallId: toolCall.toolCallId,
+			toolName: toolCall.toolName,
 			result,
-			isError,
+			isError: false, 
 		});
 
-		const toolResultMessage: ToolResultMessage = {
-			role: "toolResult",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			content: result.content,
-			details: result.details,
-			isError,
+		const toolMessage: AgentToolMessage = {
+			role: "tool",
+			content: [
+				{
+					type: "tool-result",
+					toolCallId: toolCall.toolCallId,
+					toolName: toolCall.toolName,
+					result: result,
+				},
+			],
 			timestamp: Date.now(),
 		};
 
-		results.push(toolResultMessage);
-		stream.push({ type: "message_start", message: toolResultMessage });
-		stream.push({ type: "message_end", message: toolResultMessage });
+		results.push(toolMessage);
+		stream.push({ type: "message_start", message: toolMessage });
+		stream.push({ type: "message_end", message: toolMessage });
 
-		// Check for steering messages - skip remaining tools if user interrupted
 		if (getSteeringMessages) {
 			const steering = await getSteeringMessages();
 			if (steering.length > 0) {
 				steeringMessages = steering;
-				const remainingCalls = toolCalls.slice(index + 1);
-				for (const skipped of remainingCalls) {
-					results.push(skipToolCall(skipped, stream));
-				}
 				break;
 			}
 		}
 	}
 
 	return { toolResults: results, steeringMessages };
-}
-
-function skipToolCall(
-	toolCall: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
-	stream: EventStream<AgentEvent, AgentMessage[]>,
-): ToolResultMessage {
-	const result: AgentToolResult<any> = {
-		content: [{ type: "text", text: "Skipped due to queued user message." }],
-		details: {},
-	};
-
-	stream.push({
-		type: "tool_execution_start",
-		toolCallId: toolCall.id,
-		toolName: toolCall.name,
-		args: toolCall.arguments,
-	});
-	stream.push({
-		type: "tool_execution_end",
-		toolCallId: toolCall.id,
-		toolName: toolCall.name,
-		result,
-		isError: true,
-	});
-
-	const toolResultMessage: ToolResultMessage = {
-		role: "toolResult",
-		toolCallId: toolCall.id,
-		toolName: toolCall.name,
-		content: result.content,
-		details: {},
-		isError: true,
-		timestamp: Date.now(),
-	};
-
-	stream.push({ type: "message_start", message: toolResultMessage });
-	stream.push({ type: "message_end", message: toolResultMessage });
-
-	return toolResultMessage;
 }
