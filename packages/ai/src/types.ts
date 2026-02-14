@@ -4,7 +4,6 @@ import {
 	type CoreUserMessage,
 	type CoreAssistantMessage,
 	type CoreToolMessage,
-	type Tool as VercelTool,
 } from "ai";
 import type { TSchema } from "@sinclair/typebox";
 import { AssistantMessageEventStream } from "./utils/event-stream.js";
@@ -14,8 +13,9 @@ export type { AssistantMessageEventStream } from "./utils/event-stream.js";
 export type Api = string;
 export type Provider = string;
 
-export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+/** Token budgets for each thinking level (token-based providers only) */
 export interface ThinkingBudgets {
 	minimal?: number;
 	low?: number;
@@ -30,6 +30,11 @@ export interface StreamOptions {
 	apiKey?: string;
 	headers?: Record<string, string>;
 	metadata?: Record<string, unknown>;
+    /**
+	 * Prompt cache retention preference. Providers map this to their supported values.
+	 * Default: "short".
+	 */
+	cacheRetention?: "none" | "short" | "long";
 }
 
 export interface SimpleStreamOptions extends StreamOptions {
@@ -92,9 +97,8 @@ export interface Model<TApi extends Api = Api> {
 	cost: {
 		input: number;
 		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		total: number;
+		cacheRead: number; // $/million tokens
+		cacheWrite: number; // $/million tokens
 	};
 	contextWindow: number;
 	maxTokens: number;

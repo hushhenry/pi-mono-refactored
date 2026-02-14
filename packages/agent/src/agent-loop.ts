@@ -1,4 +1,11 @@
-import { streamText, type CoreMessage } from "ai";
+/**
+ * Agent loop that works with Vercel CoreMessage throughout.
+ */
+
+import {
+	type CoreMessage,
+	streamText,
+} from "ai";
 import { EventStream } from "./utils/event-stream.js";
 import type {
 	AgentContext,
@@ -10,6 +17,9 @@ import type {
 	AgentToolMessage,
 } from "./types.js";
 
+/**
+ * Start an agent loop with a new prompt message.
+ */
 export function agentLoop(
 	prompts: AgentMessage[],
 	context: AgentContext,
@@ -69,6 +79,9 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+/**
+ * Main loop logic.
+ */
 async function runLoop(
 	currentContext: AgentContext,
 	newMessages: AgentMessage[],
@@ -169,63 +182,31 @@ async function streamAssistantResponse(
 		? await config.convertToLlm(messages)
 		: messages.map(({ timestamp, usage, ...rest }: any) => rest as CoreMessage);
 
-    const result = await streamText({
-        model: config.model as any,
+    // Call streamSimple from AI package
+    const { streamSimple } = await import("../../../ai/src/stream.js");
+    const response = await (streamSimple as any)(config.model, {
+        systemPrompt: context.systemPrompt,
         messages: llmMessages,
-        system: context.systemPrompt,
-        abortSignal: signal,
-        tools: context.tools ? Object.fromEntries(context.tools.map(t => [t.name, {
-            description: t.description,
-            parameters: t.parameters as any
-        }])) : undefined,
-    });
+        tools: context.tools
+    }, config);
 
-    const assistantMessage: AgentAssistantMessage = {
-        role: "assistant",
-        content: [],
-        timestamp: Date.now(),
-    };
+    let partial: AgentAssistantMessage | null = null;
 
-    stream.push({ type: "message_start", message: assistantMessage });
-
-    for await (const part of result.fullStream) {
-        if (part.type === 'text-delta') {
-            const lastPart = assistantMessage.content[assistantMessage.content.length - 1];
-            if (lastPart?.type === 'text') {
-                lastPart.text += part.textDelta;
-            } else {
-                assistantMessage.content.push({ type: 'text', text: part.textDelta });
-            }
-            stream.push({ type: "message_update", message: assistantMessage, assistantMessageEvent: part as any });
-        }
-        
-        if (part.type === 'tool-call') {
-            assistantMessage.content.push({
-                type: 'tool-call',
-                toolCallId: part.toolCallId,
-                toolName: part.toolName,
-                args: part.args as any,
-            });
-            stream.push({ type: "message_update", message: assistantMessage, assistantMessageEvent: part as any });
+    for await (const event of response) {
+        if (event.type === 'start') {
+            partial = event.partial;
+            stream.push({ type: "message_start", message: partial as any });
+        } else if (event.type === 'done') {
+            stream.push({ type: "message_end", message: event.message as any });
+            return event.message as any;
+        } else if (event.type === 'error') {
+            return { role: 'assistant', content: [], timestamp: -1 } as any;
+        } else if (partial) {
+            stream.push({ type: "message_update", message: event.partial as any, assistantMessageEvent: event as any });
         }
     }
 
-    try {
-        const finalResult = await result;
-        assistantMessage.usage = {
-            input: finalResult.usage.promptTokens,
-            output: finalResult.usage.completionTokens,
-            totalTokens: finalResult.usage.totalTokens,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-        };
-    } catch (e) {
-        assistantMessage.timestamp = -1; 
-    }
-
-    stream.push({ type: "message_end", message: assistantMessage });
-    return assistantMessage;
+    return await response.result();
 }
 
 async function executeToolCalls(
@@ -256,14 +237,18 @@ async function executeToolCalls(
 			if (!tool) throw new Error(`Tool ${toolCall.toolName} not found`);
 			if (!tool.execute) throw new Error(`Tool ${toolCall.toolName} has no execute function`);
 			
-			result = await tool.execute(toolCall.toolCallId, toolCall.args, signal, (partialResult) => {
-				stream.push({
-					type: "tool_execution_update",
-					toolCallId: toolCall.toolCallId,
-					toolName: toolCall.toolName,
-					args: toolCall.args,
-					partialResult,
-				});
+			result = await tool.execute(toolCall.args, {
+				toolCallId: toolCall.toolCallId,
+				signal,
+				onUpdate: (partialResult) => {
+					stream.push({
+						type: "tool_execution_update",
+						toolCallId: toolCall.toolCallId,
+						toolName: toolCall.toolName,
+						args: toolCall.args,
+						partialResult,
+					});
+				}
 			});
 		} catch (e) {
 			result = e instanceof Error ? e.message : String(e);

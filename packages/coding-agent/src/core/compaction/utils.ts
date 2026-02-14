@@ -1,13 +1,5 @@
-/**
- * Shared utilities for compaction and branch summarization.
- */
-
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
-
-// ============================================================================
-// File Operation Tracking
-// ============================================================================
+import { type AgentMessage, type AgentAssistantMessage, type AgentToolMessage } from "../../../../../ai/src/types.js";
+import { type CoreMessage } from "ai";
 
 export interface FileOperations {
 	read: Set<string>;
@@ -23,42 +15,29 @@ export function createFileOps(): FileOperations {
 	};
 }
 
-/**
- * Extract file operations from tool calls in an assistant message.
- */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role !== "assistant") return;
-	if (!("content" in message) || !Array.isArray(message.content)) return;
+	const assistantMsg = message as AgentAssistantMessage;
 
-	for (const block of message.content) {
-		if (typeof block !== "object" || block === null) continue;
-		if (!("type" in block) || block.type !== "toolCall") continue;
-		if (!("arguments" in block) || !("name" in block)) continue;
+	for (const block of assistantMsg.content) {
+		if (block.type !== "tool-call") continue;
+		const args = block.args as any;
+		if (!args || typeof args.path !== "string") continue;
 
-		const args = block.arguments as Record<string, unknown> | undefined;
-		if (!args) continue;
-
-		const path = typeof args.path === "string" ? args.path : undefined;
-		if (!path) continue;
-
-		switch (block.name) {
+		switch (block.toolName) {
 			case "read":
-				fileOps.read.add(path);
+				fileOps.read.add(args.path);
 				break;
 			case "write":
-				fileOps.written.add(path);
+				fileOps.written.add(args.path);
 				break;
 			case "edit":
-				fileOps.edited.add(path);
+				fileOps.edited.add(args.path);
 				break;
 		}
 	}
 }
 
-/**
- * Compute final file lists from file operations.
- * Returns readFiles (files only read, not modified) and modifiedFiles.
- */
 export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
 	const readOnly = [...fileOps.read].filter((f) => !modified.has(f)).sort();
@@ -66,9 +45,6 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 	return { readFiles: readOnly, modifiedFiles };
 }
 
-/**
- * Format file operations as XML tags for summary.
- */
 export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
 	const sections: string[] = [];
 	if (readFiles.length > 0) {
@@ -81,74 +57,50 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 	return `\n\n${sections.join("\n\n")}`;
 }
 
-// ============================================================================
-// Message Serialization
-// ============================================================================
-
-/**
- * Serialize LLM messages to text for summarization.
- * This prevents the model from treating it as a conversation to continue.
- * Call convertToLlm() first to handle custom message types.
- */
-export function serializeConversation(messages: Message[]): string {
+export function serializeConversation(messages: CoreMessage[]): string {
 	const parts: string[] = [];
 
 	for (const msg of messages) {
 		if (msg.role === "user") {
-			const content =
-				typeof msg.content === "string"
-					? msg.content
-					: msg.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map((c) => c.text)
-							.join("");
-			if (content) parts.push(`[User]: ${content}`);
+			const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+			parts.push(`[User]: ${content}`);
 		} else if (msg.role === "assistant") {
 			const textParts: string[] = [];
-			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
 
-			for (const block of msg.content) {
-				if (block.type === "text") {
-					textParts.push(block.text);
-				} else if (block.type === "thinking") {
-					thinkingParts.push(block.thinking);
-				} else if (block.type === "toolCall") {
-					const args = block.arguments as Record<string, unknown>;
-					const argsStr = Object.entries(args)
-						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-						.join(", ");
-					toolCalls.push(`${block.name}(${argsStr})`);
-				}
-			}
+			if (typeof msg.content === 'string') {
+                textParts.push(msg.content);
+            } else if (Array.isArray(msg.content)) {
+                for (const part of msg.content) {
+                    if (part.type === 'text') textParts.push(part.text);
+                    if (part.type === 'tool-call') toolCalls.push(`${part.toolName}(${JSON.stringify(part.args)})`);
+                }
+            }
 
-			if (thinkingParts.length > 0) {
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
-			}
-			if (textParts.length > 0) {
-				parts.push(`[Assistant]: ${textParts.join("\n")}`);
-			}
-			if (toolCalls.length > 0) {
-				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
-			}
-		} else if (msg.role === "toolResult") {
-			const content = msg.content
-				.filter((c): c is { type: "text"; text: string } => c.type === "text")
-				.map((c) => c.text)
-				.join("");
-			if (content) {
-				parts.push(`[Tool result]: ${content}`);
-			}
+			if (textParts.length > 0) parts.push(`[Assistant]: ${textParts.join("\n")}`);
+			if (toolCalls.length > 0) parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+		} else if (msg.role === "tool") {
+			parts.push(`[Tool result]: ${JSON.stringify(msg.content)}`);
 		}
 	}
 
 	return parts.join("\n\n");
 }
 
-// ============================================================================
-// Summarization System Prompt
-// ============================================================================
+export function estimateTokens(message: AgentMessage): number {
+	let chars = 0;
+    if (typeof message.content === 'string') {
+        chars += message.content.length;
+    } else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+            if (part.type === 'text') chars += part.text.length;
+            if (part.type === 'tool-call') chars += part.toolName.length + JSON.stringify(part.args).length + 50;
+            if (part.type === 'tool-result') chars += JSON.stringify(part.result).length;
+            if (part.type === 'image') chars += 4800;
+        }
+    }
+	return Math.ceil(chars / 4);
+}
 
-export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
-
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary.
+Do NOT continue the conversation. Do NOT respond to any questions. ONLY output the structured summary.`;

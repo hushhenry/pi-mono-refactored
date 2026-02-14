@@ -1,4 +1,4 @@
-import { streamText, type CoreMessage } from "ai";
+import { streamText, type CoreMessage, type LanguageModel } from "ai";
 import { EventStream } from "./utils/event-stream.js";
 import type {
 	AgentAssistantMessage,
@@ -8,12 +8,17 @@ import type {
 	SimpleStreamOptions,
 } from "./types.js";
 
-// Helper to convert Model to LanguageModel (this would normally be in a model registry)
-// For now, I'll assume we have a way to get the LanguageModel instance.
-async function getVercelModel(model: Model): Promise<any> {
-    // This is where vercel-ai-extra-providers and standard providers come in.
-    // Placeholder implementation
-    return null; 
+// Global registry for Vercel LanguageModels
+const modelRegistry = new Map<string, LanguageModel>();
+
+export function registerVercelModel(id: string, model: LanguageModel) {
+    modelRegistry.set(id, model);
+}
+
+function getVercelModel(model: Model): LanguageModel {
+    const instance = modelRegistry.get(model.id);
+    if (!instance) throw new Error(`Vercel model not registered: ${model.id}`);
+    return instance;
 }
 
 export function streamSimple<TApi extends string>(
@@ -28,8 +33,7 @@ export function streamSimple<TApi extends string>(
 
 	(async () => {
 		try {
-            const vercelModel = await getVercelModel(model);
-            if (!vercelModel) throw new Error("Could not resolve Vercel model");
+            const vercelModel = getVercelModel(model);
 
             const messages: CoreMessage[] = context.messages.map(({ timestamp, usage, ...rest }: any) => rest);
 
@@ -40,6 +44,14 @@ export function streamSimple<TApi extends string>(
 				abortSignal: options?.signal,
 				temperature: options?.temperature,
 				maxTokens: options?.maxTokens,
+                // Map ThinkingLevel to Vercel reasoning effort or budgets
+                // Note: Actual mapping depends on the provider (OpenAI vs Anthropic)
+                ...(options?.reasoning && { 
+                    providerOptions: {
+                        openai: { reasoningEffort: options.reasoning === 'xhigh' ? 'high' : options.reasoning },
+                        anthropic: { thinking: { type: 'enabled', budgetTokens: options.thinkingBudgets?.[options.reasoning] || 1024 } }
+                    }
+                }),
                 tools: context.tools ? Object.fromEntries(context.tools.map(t => [t.name, {
                     description: t.description,
                     parameters: t.parameters as any
